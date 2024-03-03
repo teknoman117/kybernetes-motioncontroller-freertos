@@ -45,6 +45,8 @@ void TaskHeartbeat(void *pvParameters) {
 }
 
 void TaskSonars(void *pvParameters) {
+    uint8_t address = * (uint8_t*) pvParameters;
+
     // get software revision command
     uint8_t commandRegister = 0;
     uint8_t softwareRevision = 0;
@@ -53,12 +55,12 @@ void TaskSonars(void *pvParameters) {
         {
             .data = &commandRegister,
             .len = sizeof commandRegister - 1,
-            .address = 0xE2,
+            .address = address,
         },
         {
             .data = &softwareRevision,
             .len = sizeof softwareRevision - 1,
-            .address = 0xE3,
+            .address = address + 1,
         },
     };
 
@@ -69,18 +71,76 @@ void TaskSonars(void *pvParameters) {
         .error = 0,
     };
 
-    while (1) {
-        getSoftwareRevision.error = 0;
+    // begin ranging command
+    uint8_t beginRangingCommand[2] = {0, 0x51};
+    uint8_t rangingResultRegister = 2;
+    uint8_t rangingResult[2] = {0, 0};
 
-        // submit get transfer
-        queueI2CTransfer(&getSoftwareRevision);
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        // print out the software revision
-        if (!getSoftwareRevision.error) {
-            CONSOLE(printf_P(PSTR("sonar @ E2h software revision = %u\r\n"), softwareRevision));
-            softwareRevision = 0;
+    i2c_msg_t startRangingMsgs[] = {
+        {
+            .data = beginRangingCommand,
+            .len = sizeof beginRangingCommand - 1,
+            .address = address,
         }
+    };
+
+    i2c_transfer_t beginRanging = {
+        .notify = xTaskGetCurrentTaskHandle(),
+        .msgs = startRangingMsgs,
+        .n = 0,
+        .error = 0,
+    };
+
+    i2c_msg_t getRangingResultMsgs[] = {
+        {
+            .data = &rangingResultRegister,
+            .len = sizeof rangingResultRegister - 1,
+            .address = address,
+        },
+        {
+            .data = rangingResult,
+            .len = sizeof rangingResult - 1,
+            .address = address + 1,
+        }
+    };
+
+    i2c_transfer_t getRangingResult = {
+        .notify = xTaskGetCurrentTaskHandle(),
+        .msgs = getRangingResultMsgs,
+        .n = 1,
+        .error = 0,
+    };
+
+    // get the software revision
+    queueI2CTransfer(&getSoftwareRevision);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (!getSoftwareRevision.error) {
+        CONSOLE(printf_P(PSTR("sonar @ %02xh software revision = %u\r\n"), address, softwareRevision));
+    }
+
+    TickType_t wakeUpTime = xTaskGetTickCount();
+    while (1) {
+        // submit get transfer
+        do {
+            queueI2CTransfer(&beginRanging);
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        } while (beginRanging.error);
+
+        // get the range
+        do {
+            queueI2CTransfer(&getRangingResult);
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        } while (getRangingResult.error);
+
+        uint16_t range = rangingResult[0];
+        range <<= 8;
+        range |= rangingResult[1];
+
+        // display range
+        CONSOLE(printf_P(PSTR("sonar @ %02xh = %u cm\r\n"), address, range));
+
+        // wait for ringing to stop
+        vTaskDelayUntil(&wakeUpTime, 66 / portTICK_PERIOD_MS);
     }
 }
 
@@ -90,7 +150,13 @@ void main(void) {
     setupUART0();
     setupConsole();
 
+    uint8_t sonar1 = 0xE0;
+    uint8_t sonar2 = 0xE2;
+    uint8_t sonar3 = 0xE4;
+
     xTaskCreate(TaskHeartbeat, "Blink", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
-    xTaskCreate(TaskSonars, "Sonars", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    xTaskCreate(TaskSonars, "Sonar1", configMINIMAL_STACK_SIZE, &sonar1, 2, NULL);
+    xTaskCreate(TaskSonars, "Sonar2", configMINIMAL_STACK_SIZE, &sonar2, 2, NULL);
+    xTaskCreate(TaskSonars, "Sonar3", configMINIMAL_STACK_SIZE, &sonar3, 2, NULL);
     vTaskStartScheduler();
 }

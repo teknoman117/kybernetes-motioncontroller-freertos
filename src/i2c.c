@@ -8,6 +8,9 @@
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 
+#include <stdio.h>
+#include "console.h"
+
 static TaskHandle_t uI2CTaskHandle;
 static QueueHandle_t uTransferQueue;
 
@@ -27,69 +30,108 @@ void I2CTask(void *pvParameters) {
         // Get the next transfer from the queue
         i2c_transfer_t *transfer = NULL;
         while (!xQueueReceive(uTransferQueue, &transfer, portMAX_DELAY));
+        //CONSOLE(printf_P(PSTR("[i2c] starting transfer. %u phases.\r\n"), transfer->n + 1));
 
         uint8_t n = 0;
+        transfer->error = 0;
         do {
             i2c_msg_t *msg = &transfer->msgs[n];
-            uint8_t dir = msg->address & 0x01;
+            //CONSOLE(printf_P(PSTR("[i2c] starting phase %u.\r\n"), n));
             
             // send start or repeated start
             TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);
             while (!(TWCR & _BV(TWINT)))
                 portYIELD();
 
-            // if status isn't start, abort
-            if (TWSR & 0xF8 != 0x08 && TWSR & 0xF8 != 0x10) {
-                transfer->error = 1;
-                goto i2c_task_error;
-            }
-            
-            // send address
-            TWDR = msg->address;
-            TWCR = _BV(TWINT) | _BV(TWEN);
-            while (!(TWCR & _BV(TWINT)))
-                portYIELD();
-
-            if (TWSR & 0xF8 == 0x20 || TWSR & 0xF8 == 0x38 || TWSR & 0xF8 == 0x48) {
-                transfer->error = 1;
-                break;
-            }
-
-            // transfer data
+            // state machine
             uint8_t i = 0;
+            uint8_t complete = 0;
             do {
-                if (dir) {
-                    // read
-                    if (i != msg->len) {
-                        // normal byte (send ack)
-                        TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN);
-                    } else {
-                        // last byte (send nack)
-                        TWCR = _BV(TWINT) | _BV(TWEN);
-                    }
-                } else {
-                    TWDR = msg->data[i];
-                    TWCR = _BV(TWINT) | _BV(TWEN);
+                //CONSOLE(printf_P(PSTR("[i2c] twsr: %02x.\r\n"), TWSR & 0xF8));
+                uint8_t control = _BV(TWINT) | _BV(TWEN);
+                switch (TWSR & 0xF8) {
+                    case 0x08:
+                        // START
+                        /* FALLTHROUGH */
+                    case 0x10:
+                        // REPEATED-START
+                        // load slave address
+                        TWDR = msg->address;
+                        break;
+
+                    case 0x18:
+                        // SLA+W transmitted, ACK received
+                        /* FALLTHROUGH */
+                    case 0x28:
+                        // Data transmitted, ACK received
+                        TWDR = msg->data[i];
+                        if (i++ == msg->len)
+                            complete = 1;
+                        break;
+
+                    case 0x20:
+                        // SLA+W transmitted, NACK received
+                        /* FALLTHROUGH */
+                    case 0x30:
+                        // Data transmitted, NACK received
+                        transfer->error = 1;
+                        complete = 1;
+                        control = 0;
+                        break;
+
+                    case 0x38:
+                        // Arbitration loss
+                        transfer->error = 1;
+                        complete = 1;
+                        control = 0;
+                        break;
+
+                    case 0x40:
+                        // SLA+R transmitted, ACK received
+                        if (i != msg->len) {
+                            control |= _BV(TWEA);
+                        } 
+                        break;
+                    case 0x48:
+                        // SLA+R transmitted, NACK received
+                        transfer->error = 1;
+                        complete = 1;
+                        control = 0;
+                        break;
+                    case 0x50:
+                        // Data received, ACK transmitted
+                        msg->data[i++] = TWDR;
+                        if (i != msg->len) {
+                            control |= _BV(TWEA);
+                        }
+                        break;
+
+                    case 0x58:
+                        // Data received, NACK transmitted
+                        msg->data[i++] = TWDR;
+                        complete = 1;
+                        control = 0;
+                        break;
+                    default:
+                        transfer->error = 1;
+                        complete = 1;
+                        control = 0;
+                        break;
                 }
 
-                while (!(TWCR & _BV(TWINT)))
-                    portYIELD();
-
-                if (dir) {
-                    // read
-                    msg->data[i] = TWDR;
-                } else {
-                    // write
-                    // check ack/nack
+                // write the control register if requested
+                if (control) {
+                    TWCR = control;
+                    while (!(TWCR & _BV(TWINT)))
+                        portYIELD();
                 }
-            } while (i++ != msg->len);
-        } while (n++ != transfer->n);
+            } while (!complete);
+        } while ((n++ != transfer->n) && !transfer->error);
 
         // send stop
         TWCR = _BV(TWINT) | _BV(TWSTO) | _BV(TWEN);
 
         // notify calling task
-i2c_task_error:
         if (transfer->notify) {
             xTaskNotifyGive(transfer->notify);
         }
