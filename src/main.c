@@ -112,10 +112,14 @@ void TaskSonars(void *pvParameters) {
     };
 
     // get the software revision
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     queueI2CTransfer(&getSoftwareRevision);
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (!getSoftwareRevision.error) {
         CONSOLE(printf_P(PSTR("sonar @ %02xh software revision = %u\r\n"), address, softwareRevision));
+    } else {
+        CONSOLE(printf_P(PSTR("sonar @ %02xh not found\r\n"), address));
+        vTaskSuspend(xTaskGetCurrentTaskHandle());
     }
 
     TickType_t wakeUpTime = xTaskGetTickCount();
